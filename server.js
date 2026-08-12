@@ -107,6 +107,11 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
            '(KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Внутрішній API OLX вимагає анонімний Bearer-токен, який використовує сам
+// їхній веб-фронт (це не персональний токен, а публічний клієнтський). Якщо
+// OLX його колись зротує і піде 401/400 — постав свіжий у змінній OLX_TOKEN.
+const OLX_TOKEN = process.env.OLX_TOKEN || '6c8bea54aaecbbabfcbdadf99feb845781026be5';
+
 async function fetchPage(categoryId, regionId, offset) {
   const url = new URL('https://www.olx.ua/api/v1/offers/');
   url.searchParams.set('category_id', String(categoryId));
@@ -115,10 +120,19 @@ async function fetchPage(categoryId, regionId, offset) {
   url.searchParams.set('sort_by', 'created_at:desc');
   if (regionId) url.searchParams.set('region_id', String(regionId));
   const res = await fetch(url, {
-    headers: { 'User-Agent': UA, Accept: 'application/json',
-               'Accept-Language': 'uk-UA,uk;q=0.9,en;q=0.5' },
+    headers: {
+      'User-Agent': UA,
+      Accept: '*/*',
+      'Accept-Language': 'uk-UA,uk;q=0.9,en;q=0.5',
+      Authorization: `Bearer ${OLX_TOKEN}`,
+      'X-Platform-Type': 'mobile-html5',
+    },
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status} (offset ${offset})`);
+  if (!res.ok) {
+    let body = '';
+    try { body = (await res.text()).slice(0, 200).replace(/\s+/g, ' '); } catch {}
+    throw new Error(`HTTP ${res.status} (offset ${offset}) ${body}`);
+  }
   return res.json();
 }
 const parsePrice = (p = []) => {
