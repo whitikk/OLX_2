@@ -15,7 +15,7 @@ function openDb(path = DB_PATH) {
   db.pragma('journal_mode = WAL');
   db.exec(`
     CREATE TABLE IF NOT EXISTS offers (
-      offer_id INTEGER PRIMARY KEY, category_id INTEGER, title TEXT, brand TEXT,
+      offer_id INTEGER PRIMARY KEY, category_id INTEGER, segment TEXT, title TEXT, brand TEXT,
       line TEXT, type TEXT, price_uah REAL, condition TEXT, city TEXT, region TEXT,
       created_time TEXT, promoted INTEGER, first_seen TEXT, last_seen TEXT,
       gone_at TEXT, age_days_at_gone REAL
@@ -23,8 +23,11 @@ function openDb(path = DB_PATH) {
     CREATE TABLE IF NOT EXISTS crawls (crawl_ts TEXT PRIMARY KEY, count INTEGER);
     CREATE INDEX IF NOT EXISTS idx_offers_brand ON offers(brand);
     CREATE INDEX IF NOT EXISTS idx_offers_gone  ON offers(gone_at);
-    CREATE INDEX IF NOT EXISTS idx_offers_cat   ON offers(category_id);
+    CREATE INDEX IF NOT EXISTS idx_offers_seg   ON offers(segment);
   `);
+  // міграція для БД, створених до появи колонки segment
+  const cols = db.prepare('PRAGMA table_info(offers)').all().map((c) => c.name);
+  if (!cols.includes('segment')) db.exec('ALTER TABLE offers ADD COLUMN segment TEXT');
   return db;
 }
 
@@ -142,11 +145,11 @@ const parseCondition = (p = []) => {
   const k = p.find((x) => x.key === 'state')?.value?.key;
   return k === 'new' ? 'new' : k === 'used' ? 'used' : 'unknown';
 };
-function normalize(o, segKey) {
+function normalize(o, seg) {
   const title = o.title || '';
   const brand = detectBrand(title);
   return {
-    offer_id: o.id, category_id: segKey, title, brand,
+    offer_id: o.id, category_id: seg.categoryId ?? null, segment: seg.segment, title, brand,
     line: extractLine(title, brand), type: detectType(title),
     price_uah: parsePrice(o.params), condition: parseCondition(o.params),
     city: o.location?.city?.name || null, region: o.location?.region?.name || null,
@@ -155,7 +158,7 @@ function normalize(o, segKey) {
   };
 }
 
-// Сегмент = { key, label, params } — або категорія, або пошуковий запит.
+// Сегмент = { label, segment, params, categoryId? } — категорія або пошук.
 async function crawlSegment({ db, seg, regionId, now, prev, onProgress }) {
   const params = { ...seg.params };
   if (regionId) params.region_id = regionId;
@@ -166,23 +169,23 @@ async function crawlSegment({ db, seg, regionId, now, prev, onProgress }) {
     catch (e) { if (onProgress) onProgress(`${seg.label}: ${e.message} — стоп`); break; }
     const data = page.data || [];
     if (data.length === 0) break;
-    for (const o of data) seen.push(normalize(o, seg.key));
+    for (const o of data) seen.push(normalize(o, seg));
     if (onProgress) onProgress(`${seg.label}: ${seen.length}`);
     if (!page.links?.next?.href) break;
     await sleep(DELAY_MS);
   }
-  if (seen.length === 0) return { key: seg.key, count: 0, withBrand: 0, gone: 0 };
+  if (seen.length === 0) return { segment: seg.segment, count: 0, withBrand: 0, gone: 0 };
 
   const oldestCovered = seen.map((s) => s.created_time).filter(Boolean).sort()[0];
   const upsert = db.prepare(`
     INSERT INTO offers
-      (offer_id, category_id, title, brand, line, type, price_uah, condition,
+      (offer_id, category_id, segment, title, brand, line, type, price_uah, condition,
        city, region, created_time, promoted, first_seen, last_seen, gone_at, age_days_at_gone)
     VALUES
-      (@offer_id, @category_id, @title, @brand, @line, @type, @price_uah, @condition,
+      (@offer_id, @category_id, @segment, @title, @brand, @line, @type, @price_uah, @condition,
        @city, @region, @created_time, @promoted, @now, @now, NULL, NULL)
     ON CONFLICT(offer_id) DO UPDATE SET
-      last_seen = @now, price_uah = @price_uah, promoted = @promoted,
+      segment = @segment, last_seen = @now, price_uah = @price_uah, promoted = @promoted,
       gone_at = NULL, age_days_at_gone = NULL
   `);
   db.transaction((rows) => { for (const r of rows) upsert.run({ ...r, now }); })(seen);
@@ -192,11 +195,11 @@ async function crawlSegment({ db, seg, regionId, now, prev, onProgress }) {
     gone = db.prepare(`
       UPDATE offers SET gone_at = @now,
         age_days_at_gone = julianday(@now) - julianday(created_time)
-      WHERE gone_at IS NULL AND category_id = @key
+      WHERE gone_at IS NULL AND segment = @segment
         AND last_seen = @prev AND last_seen != @now AND created_time >= @oldest
-    `).run({ now, prev, key: seg.key, oldest: oldestCovered }).changes;
+    `).run({ now, prev, segment: seg.segment, oldest: oldestCovered }).changes;
   }
-  return { key: seg.key, count: seen.length, withBrand: seen.filter((s) => s.brand).length, gone };
+  return { segment: seg.segment, count: seen.length, withBrand: seen.filter((s) => s.brand).length, gone };
 }
 
 async function runCrawlCycle({ db, segments, regionId, onProgress }) {
@@ -228,6 +231,13 @@ const round = (x, d = 1) => (x == null ? null : Number(x.toFixed(d)));
 
 function getStatus(db) {
   const crawls = db.prepare('SELECT crawl_ts, count FROM crawls ORDER BY crawl_ts').all();
+  const segments = db.prepare(
+    "SELECT segment, COUNT(*) n, MAX(last_seen) last FROM offers WHERE segment IS NOT NULL GROUP BY segment ORDER BY last DESC"
+  ).all().map((r) => ({
+    segment: r.segment,
+    label: r.segment.startsWith('q:') ? r.segment.slice(2) : r.segment.replace('cat:', 'категорія '),
+    count: r.n,
+  }));
   return {
     crawlCount: crawls.length,
     firstCrawl: crawls[0]?.crawl_ts || null,
@@ -235,7 +245,8 @@ function getStatus(db) {
     totalOffers: db.prepare('SELECT COUNT(*) n FROM offers').get().n,
     liveOffers: db.prepare('SELECT COUNT(*) n FROM offers WHERE gone_at IS NULL').get().n,
     cities: db.prepare("SELECT city FROM offers WHERE city IS NOT NULL GROUP BY city ORDER BY COUNT(*) DESC LIMIT 40").all().map((r) => r.city),
-    categories: db.prepare('SELECT category_id id, COUNT(*) n FROM offers GROUP BY category_id ORDER BY n DESC').all(),
+    categories: db.prepare('SELECT category_id id, COUNT(*) n FROM offers WHERE category_id IS NOT NULL GROUP BY category_id ORDER BY n DESC').all(),
+    segments,
   };
 }
 
@@ -243,8 +254,10 @@ function computeTurnover(db, opts = {}) {
   const maxAge = Number(opts.maxAge ?? 21), minSold = Number(opts.minSold ?? 2);
   const city = opts.city || null, type = opts.type || null;
   const categoryId = opts.categoryId ? Number(opts.categoryId) : null;
+  const segment = opts.segment || null;
 
   let rows = db.prepare('SELECT * FROM offers WHERE brand IS NOT NULL').all();
+  if (segment) rows = rows.filter((r) => r.segment === segment);
   if (city) rows = rows.filter((r) => r.city === city);
   if (type) rows = rows.filter((r) => r.type === type);
   if (categoryId) rows = rows.filter((r) => r.category_id === categoryId);
@@ -277,11 +290,14 @@ function computeTurnover(db, opts = {}) {
 function computeSupply(db, opts = {}) {
   const city = opts.city || null, type = opts.type || null;
   const categoryId = opts.categoryId ? Number(opts.categoryId) : null;
+  const segment = opts.segment || null;
   const fresh = Math.max(20, Number(opts.fresh ?? 80)); // "перші сторінки" ≈ N найсвіжіших
 
-  const last = db.prepare('SELECT crawl_ts FROM crawls ORDER BY crawl_ts DESC LIMIT 1').get()?.crawl_ts;
   let rows = db.prepare('SELECT * FROM offers WHERE gone_at IS NULL').all();
-  if (last) rows = rows.filter((r) => r.last_seen === last);      // тільки реально присутні зараз
+  if (segment) rows = rows.filter((r) => r.segment === segment);
+  // показуємо лише те, що було присутнє в НАЙСВІЖІШОМУ проході цієї вибірки
+  const ref = rows.reduce((m, r) => (r.last_seen > m ? r.last_seen : m), '');
+  if (ref) rows = rows.filter((r) => r.last_seen === ref);
   if (city) rows = rows.filter((r) => r.city === city);
   if (type) rows = rows.filter((r) => r.type === type);
   if (categoryId) rows = rows.filter((r) => r.category_id === categoryId);
@@ -317,7 +333,7 @@ function computeSupply(db, opts = {}) {
   stats.sort((a, b) => b.listings - a.listings);
   return {
     meta: { totalLive, withBrand: branded.length, unbranded: totalLive - branded.length,
-            brands: stats.length, fresh, lastCrawl: last },
+            brands: stats.length, fresh, lastCrawl: ref || null },
     rows: stats,
   };
 }
@@ -335,6 +351,7 @@ function clientApp() {
     { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
   let status = null;
   let mode = 'supply';   // 'supply' = пропозиція зараз (1 краул), 'turnover' = оборотність (2+)
+  let pendingSegment = null;
 
   function heatColor(vel, minV, maxV) {
     const gold = [230, 178, 76], cool = [94, 147, 168];
@@ -361,11 +378,17 @@ function clientApp() {
     const cat = $('#category');
     if (cat.options.length <= 1 && status.categories?.length > 1)
       for (const c of status.categories) cat.add(new Option(`#${c.id} (${c.n})`, c.id));
+    const seg = $('#segment'), segs = status.segments || [], cur = seg.value;
+    seg.innerHTML = '<option value="">усі слова</option>' +
+      segs.map((s) => `<option value="${s.segment}">${s.label} (${s.count})</option>`).join('');
+    if (pendingSegment && segs.some((s) => s.segment === pendingSegment)) { seg.value = pendingSegment; pendingSegment = null; }
+    else if (cur) seg.value = cur;
   }
   function params() {
     return new URLSearchParams({
       maxAge: $('#maxAge').value, minSold: $('#minSold').value,
       city: $('#city').value, type: $('#type').value, categoryId: $('#category').value,
+      segment: $('#segment') ? $('#segment').value : '',
     }).toString();
   }
   const emptyBox = (h, p, btn) =>
@@ -376,10 +399,10 @@ function clientApp() {
     const needed = mode === 'turnover' ? 2 : 1;
     if (status.crawlCount < needed) {
       const msg = status.crawlCount === 0
-        ? 'Ще немає даних. Тисни «Зібрати зараз», щоб зняти перший знімок каталогу.'
-        : `Є перший знімок. «Пропозиція зараз» уже доступна — перемкни режим угорі. Оборотність зʼявиться після другого краулу (за розкладом ${status.schedule}, ${status.tz}).`;
-      board.innerHTML = emptyBox(status.crawlCount === 0 ? 'Порожньо' : 'Потрібен другий знімок', msg, true);
-      $('#emptyCrawl').onclick = crawlNow;
+        ? 'Введи слово у полі згори (напр. духи або парфуми) і натисни «Шукати» — воно збере оголошення з OLX по всій Україні.'
+        : `Є перший знімок. «Пропозиція зараз» уже доступна — перемкни режим угорі. Оборотність зʼявиться після другого збору того ж слова (за розкладом ${status.schedule}, ${status.tz}).`;
+      board.innerHTML = emptyBox(status.crawlCount === 0 ? 'Порожньо' : 'Потрібен другий знімок', msg, status.crawlCount !== 0);
+      if (status.crawlCount !== 0) $('#emptyCrawl').onclick = () => crawlNow();
       return;
     }
     return mode === 'supply' ? renderSupply(board) : renderTurnover(board);
@@ -424,14 +447,24 @@ function clientApp() {
       if (!status.crawling) { clearInterval(iv); polling = false; loadBoard(); }
     }, 2500);
   }
-  async function crawlNow() {
+  async function crawlNow(query) {
     let token = localStorage.getItem('adminToken') || '';
-    const res = await fetch('/api/crawl', { method: 'POST', headers: token ? { 'x-admin-token': token } : {} });
+    const res = await fetch('/api/crawl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { 'x-admin-token': token } : {}) },
+      body: JSON.stringify(query ? { query } : {}),
+    });
     if (res.status === 401) {
       token = prompt('Потрібен ADMIN_TOKEN (той, що в env Railway):', '');
       if (!token) return;
       localStorage.setItem('adminToken', token);
-      return crawlNow();
+      return crawlNow(query);
+    }
+    if (query) {
+      pendingSegment = 'q:' + query.split(',')[0].trim();
+      mode = 'supply';
+      document.querySelectorAll('.seg button').forEach((x) => x.classList.toggle('on', x.dataset.mode === 'supply'));
+      $('#maxAgeWrap').style.display = 'none';
     }
     poll();
   }
@@ -442,8 +475,14 @@ function clientApp() {
     loadBoard();
   }));
   $('#maxAge').addEventListener('input', () => { $('#maxAgeOut').textContent = $('#maxAge').value + ' дн'; });
-  ['maxAge', 'minSold', 'city', 'type', 'category'].forEach((id) => $('#' + id).addEventListener('change', loadBoard));
-  $('#crawlBtn').addEventListener('click', crawlNow);
+  ['maxAge', 'minSold', 'city', 'type', 'category', 'segment'].forEach((id) => $('#' + id).addEventListener('change', loadBoard));
+  const doSearch = () => { const q = $('#q').value.trim(); if (q) crawlNow(q); };
+  $('#searchBtn').addEventListener('click', doSearch);
+  $('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
+  $('#crawlBtn').addEventListener('click', () => {
+    const sel = $('#segment').value;
+    if (sel && sel.startsWith('q:')) crawlNow(sel.slice(2)); else crawlNow();
+  });
   $('#maxAgeWrap').style.display = mode === 'turnover' ? '' : 'none';
   $('#maxAgeOut').textContent = $('#maxAge').value + ' дн';
   (async () => { await loadStatus(); await loadBoard(); })();
@@ -475,6 +514,9 @@ body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#221a2e 0%,tra
 .controls label{display:flex;flex-direction:column;gap:6px;font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}
 .controls .hint{text-transform:none;letter-spacing:0;font-size:11px}
 .controls select{background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:var(--r);padding:7px 9px;font-family:'IBM Plex Mono',monospace;font-size:13px;min-width:120px}
+.controls input[type=text]{background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:var(--r);padding:7px 9px;font-family:'IBM Plex Mono',monospace;font-size:13px;min-width:140px}
+.btn.small{padding:7px 12px;font-size:12px}
+.hidden{display:none!important}
 .rangewrap{display:flex;align-items:center;gap:10px}
 .controls input[type=range]{accent-color:var(--gold);width:130px}
 .controls output{font-family:'IBM Plex Mono',monospace;color:var(--gold);font-size:13px;min-width:46px}
@@ -523,13 +565,15 @@ const PAGE = `<!doctype html><html lang="uk"><head><meta charset="utf-8"/>
 <div class="status" id="statusChips"><span class="muted">завантаження…</span></div>
 <button class="btn" id="crawlBtn">Зібрати зараз</button></header>
 <section class="controls">
+<label class="search">Слово для пошуку<span class="rangewrap"><input type="text" id="q" placeholder="напр. духи"/><button class="btn small" id="searchBtn">Шукати</button></span></label>
+<label>Показувати<select id="segment"><option value="">усі слова</option></select></label>
 <div class="seg"><button data-mode="supply" class="on">Пропозиція зараз</button><button data-mode="turnover">Оборотність</button></div>
 <label id="maxAgeWrap">Правило продажу<span class="hint">зникло у віці ≤</span>
 <span class="rangewrap"><input type="range" id="maxAge" min="5" max="45" step="1" value="21"/><output id="maxAgeOut">21 дн</output></span></label>
-<label>Категорія<select id="category"><option value="">усі</option></select></label>
 <label>Місто<select id="city"><option value="">вся Україна</option></select></label>
 <label>Тип<select id="type"><option value="">будь-який</option><option value="full">флакон</option><option value="tester">тестер</option><option value="decant">розпив</option></select></label>
 <label>Мін. продажів<select id="minSold"><option>2</option><option>3</option><option>5</option><option>8</option></select></label>
+<label class="hidden"><select id="category"><option value="">усі</option></select></label>
 </section>
 <main class="board" id="board"></main>
 <footer class="foot"><span id="footMeta" class="muted"></span>
@@ -548,14 +592,18 @@ const QUERIES = (process.env.OLX_QUERY || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
 const REGION_ID = process.env.OLX_REGION_ID ? Number(process.env.OLX_REGION_ID) : null;
 
-// Список сегментів для збору: категорії (key = id) та/або запити (key = -1,-2,…).
+// Env-сегменти для планового (крон) збору. Слова також можна вводити на сайті.
 function buildSegments() {
   const segs = [];
   for (const id of CATEGORY_IDS)
-    segs.push({ key: id, label: `cat ${id}`, params: { category_id: id } });
-  QUERIES.forEach((q, i) =>
-    segs.push({ key: -(i + 1), label: `q "${q}"`, params: { query: q } }));
+    segs.push({ label: `cat ${id}`, segment: `cat:${id}`, categoryId: id, params: { category_id: id } });
+  for (const q of QUERIES)
+    segs.push({ label: `q "${q}"`, segment: `q:${q}`, params: { query: q } });
   return segs;
+}
+// Сегмент з довільного слова (введеного на сайті).
+function querySegment(q) {
+  return { label: `q "${q}"`, segment: `q:${q}`, params: { query: q } };
 }
 const SEGMENTS = buildSegments();
 const CRAWL_SCHEDULE = process.env.CRAWL_SCHEDULE || '0 9 * * *';
@@ -566,13 +614,13 @@ const CRAWL_ON_START = process.env.CRAWL_ON_START === '1';
 const db = openDb();
 let crawling = false, lastRun = null;
 
-async function doCrawl(trigger) {
+async function doCrawl(trigger, segments = SEGMENTS) {
   if (crawling) return { skipped: true };
-  if (SEGMENTS.length === 0) return { error: 'не задано ні OLX_CATEGORY_IDS, ні OLX_QUERY' };
+  if (segments.length === 0) return { error: 'не задано слово для пошуку' };
   crawling = true;
   try {
-    console.log(`[crawl] старт (${trigger})`);
-    const summary = await runCrawlCycle({ db, segments: SEGMENTS, regionId: REGION_ID,
+    console.log(`[crawl] старт (${trigger}): ${segments.map((s) => s.label).join(', ')}`);
+    const summary = await runCrawlCycle({ db, segments, regionId: REGION_ID,
       onProgress: (m) => process.stdout.write(`\r[crawl] ${m}        `) });
     process.stdout.write('\n');
     console.log(`[crawl] готово: ${summary.total} офферів, зникло ${summary.gone}`);
@@ -601,6 +649,12 @@ app.post('/api/crawl', (req, res) => {
   if (ADMIN_TOKEN && req.get('x-admin-token') !== ADMIN_TOKEN)
     return res.status(401).json({ error: 'потрібен вірний x-admin-token' });
   if (crawling) return res.status(409).json({ error: 'краул уже виконується' });
+  const q = (req.body?.query || '').trim();
+  if (q) {
+    const segs = q.split(',').map((s) => s.trim()).filter(Boolean).map(querySegment);
+    doCrawl('manual', segs);
+    return res.json({ started: true, segment: `q:${q.split(',')[0].trim()}` });
+  }
   doCrawl('manual');
   res.json({ started: true });
 });
