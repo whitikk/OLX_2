@@ -112,13 +112,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // OLX його колись зротує і піде 401/400 — постав свіжий у змінній OLX_TOKEN.
 const OLX_TOKEN = process.env.OLX_TOKEN || '6c8bea54aaecbbabfcbdadf99feb845781026be5';
 
-async function fetchPage(categoryId, regionId, offset) {
+async function fetchPage(extraParams, offset) {
   const url = new URL('https://www.olx.ua/api/v1/offers/');
-  url.searchParams.set('category_id', String(categoryId));
   url.searchParams.set('limit', String(LIMIT));
   url.searchParams.set('offset', String(offset));
   url.searchParams.set('sort_by', 'created_at:desc');
-  if (regionId) url.searchParams.set('region_id', String(regionId));
+  for (const [k, v] of Object.entries(extraParams)) if (v) url.searchParams.set(k, String(v));
   const res = await fetch(url, {
     headers: {
       'User-Agent': UA,
@@ -143,11 +142,11 @@ const parseCondition = (p = []) => {
   const k = p.find((x) => x.key === 'state')?.value?.key;
   return k === 'new' ? 'new' : k === 'used' ? 'used' : 'unknown';
 };
-function normalize(o, categoryId) {
+function normalize(o, segKey) {
   const title = o.title || '';
   const brand = detectBrand(title);
   return {
-    offer_id: o.id, category_id: categoryId, title, brand,
+    offer_id: o.id, category_id: segKey, title, brand,
     line: extractLine(title, brand), type: detectType(title),
     price_uah: parsePrice(o.params), condition: parseCondition(o.params),
     city: o.location?.city?.name || null, region: o.location?.region?.name || null,
@@ -156,20 +155,23 @@ function normalize(o, categoryId) {
   };
 }
 
-async function crawlCategory({ db, categoryId, regionId, now, prev, onProgress }) {
+// Сегмент = { key, label, params } — або категорія, або пошуковий запит.
+async function crawlSegment({ db, seg, regionId, now, prev, onProgress }) {
+  const params = { ...seg.params };
+  if (regionId) params.region_id = regionId;
   const seen = [];
   for (let offset = 0; offset <= MAX_OFFSET; offset += LIMIT) {
     let page;
-    try { page = await fetchPage(categoryId, regionId, offset); }
-    catch (e) { if (onProgress) onProgress(`cat ${categoryId}: ${e.message} — стоп`); break; }
+    try { page = await fetchPage(params, offset); }
+    catch (e) { if (onProgress) onProgress(`${seg.label}: ${e.message} — стоп`); break; }
     const data = page.data || [];
     if (data.length === 0) break;
-    for (const o of data) seen.push(normalize(o, categoryId));
-    if (onProgress) onProgress(`cat ${categoryId}: ${seen.length}`);
+    for (const o of data) seen.push(normalize(o, seg.key));
+    if (onProgress) onProgress(`${seg.label}: ${seen.length}`);
     if (!page.links?.next?.href) break;
     await sleep(DELAY_MS);
   }
-  if (seen.length === 0) return { categoryId, count: 0, withBrand: 0, gone: 0 };
+  if (seen.length === 0) return { key: seg.key, count: 0, withBrand: 0, gone: 0 };
 
   const oldestCovered = seen.map((s) => s.created_time).filter(Boolean).sort()[0];
   const upsert = db.prepare(`
@@ -190,27 +192,27 @@ async function crawlCategory({ db, categoryId, regionId, now, prev, onProgress }
     gone = db.prepare(`
       UPDATE offers SET gone_at = @now,
         age_days_at_gone = julianday(@now) - julianday(created_time)
-      WHERE gone_at IS NULL AND category_id = @categoryId
+      WHERE gone_at IS NULL AND category_id = @key
         AND last_seen = @prev AND last_seen != @now AND created_time >= @oldest
-    `).run({ now, prev, categoryId, oldest: oldestCovered }).changes;
+    `).run({ now, prev, key: seg.key, oldest: oldestCovered }).changes;
   }
-  return { categoryId, count: seen.length, withBrand: seen.filter((s) => s.brand).length, gone };
+  return { key: seg.key, count: seen.length, withBrand: seen.filter((s) => s.brand).length, gone };
 }
 
-async function runCrawlCycle({ db, categoryIds, regionId, onProgress }) {
+async function runCrawlCycle({ db, segments, regionId, onProgress }) {
   const now = new Date().toISOString();
   const prev = db.prepare('SELECT crawl_ts FROM crawls ORDER BY crawl_ts DESC LIMIT 1')
     .get()?.crawl_ts || null;
   const results = [];
-  for (const categoryId of categoryIds)
-    results.push(await crawlCategory({ db, categoryId, regionId, now, prev, onProgress }));
+  for (const seg of segments)
+    results.push(await crawlSegment({ db, seg, regionId, now, prev, onProgress }));
   const total = results.reduce((a, r) => a + r.count, 0);
   db.prepare('INSERT OR REPLACE INTO crawls (crawl_ts, count) VALUES (?,?)').run(now, total);
   return {
     crawledAt: now, total,
     withBrand: results.reduce((a, r) => a + r.withBrand, 0),
     gone: results.reduce((a, r) => a + r.gone, 0),
-    perCategory: results,
+    perSegment: results,
   };
 }
 
@@ -350,7 +352,7 @@ function clientApp() {
       ['всього', fmtInt(status.totalOffers)], ['останній', fmtDate(status.lastCrawl)],
     ].map(([k, v]) => `<div class="chip"><b>${v}</b><span>${k}</span></div>`).join('');
     $('#footMeta').textContent =
-      `категорії ${(status.categoryIds || []).join(', ') || '—'} · розклад ${status.schedule} (${status.tz})`;
+      `збір: ${[...(status.categoryIds||[]).map((c)=>'кат '+c), ...(status.queries||[]).map((q)=>'«'+q+'»')].join(', ') || '—'} · розклад ${status.schedule} (${status.tz})`;
     $('#crawlBtn').disabled = status.crawling;
     $('#crawlBtn').textContent = status.crawling ? 'Збираю…' : 'Зібрати зараз';
     const city = $('#city');
@@ -541,7 +543,21 @@ const PAGE = `<!doctype html><html lang="uk"><head><meta charset="utf-8"/>
 const PORT = process.env.PORT || 3000;
 const CATEGORY_IDS = (process.env.OLX_CATEGORY_IDS || process.env.OLX_CATEGORY_ID || '')
   .split(',').map((s) => s.trim()).filter(Boolean).map(Number);
+// Пошук за словами (через кому): напр. OLX_QUERY=духи,парфуми. Не потребує id категорії.
+const QUERIES = (process.env.OLX_QUERY || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 const REGION_ID = process.env.OLX_REGION_ID ? Number(process.env.OLX_REGION_ID) : null;
+
+// Список сегментів для збору: категорії (key = id) та/або запити (key = -1,-2,…).
+function buildSegments() {
+  const segs = [];
+  for (const id of CATEGORY_IDS)
+    segs.push({ key: id, label: `cat ${id}`, params: { category_id: id } });
+  QUERIES.forEach((q, i) =>
+    segs.push({ key: -(i + 1), label: `q "${q}"`, params: { query: q } }));
+  return segs;
+}
+const SEGMENTS = buildSegments();
 const CRAWL_SCHEDULE = process.env.CRAWL_SCHEDULE || '0 9 * * *';
 const TZ = process.env.TZ || 'Europe/Kyiv';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
@@ -552,11 +568,11 @@ let crawling = false, lastRun = null;
 
 async function doCrawl(trigger) {
   if (crawling) return { skipped: true };
-  if (CATEGORY_IDS.length === 0) return { error: 'не задано OLX_CATEGORY_IDS' };
+  if (SEGMENTS.length === 0) return { error: 'не задано ні OLX_CATEGORY_IDS, ні OLX_QUERY' };
   crawling = true;
   try {
     console.log(`[crawl] старт (${trigger})`);
-    const summary = await runCrawlCycle({ db, categoryIds: CATEGORY_IDS, regionId: REGION_ID,
+    const summary = await runCrawlCycle({ db, segments: SEGMENTS, regionId: REGION_ID,
       onProgress: (m) => process.stdout.write(`\r[crawl] ${m}        `) });
     process.stdout.write('\n');
     console.log(`[crawl] готово: ${summary.total} офферів, зникло ${summary.gone}`);
@@ -570,7 +586,7 @@ const app = express();
 app.use(express.json());
 app.get('/', (req, res) => res.type('html').send(PAGE));
 app.get('/api/status', (req, res) => res.json({
-  ...getStatus(db), categoryIds: CATEGORY_IDS, regionId: REGION_ID,
+  ...getStatus(db), categoryIds: CATEGORY_IDS, queries: QUERIES, regionId: REGION_ID,
   schedule: CRAWL_SCHEDULE, tz: TZ, crawling, lastRun, dbPath: DB_PATH,
 }));
 app.get('/api/analyze', (req, res) => {
@@ -592,9 +608,9 @@ app.post('/api/crawl', (req, res) => {
 app.listen(PORT, () => {
   console.log(`OLX Parfum Terminal → http://localhost:${PORT}`);
   console.log(`  БД: ${DB_PATH}`);
-  console.log(`  Категорії: ${CATEGORY_IDS.join(', ') || '(не задано!)'}`);
+  console.log(`  Збір: ${SEGMENTS.map((s) => s.label).join(', ') || '(нічого не задано!)'}`);
   console.log(`  Розклад: "${CRAWL_SCHEDULE}" (${TZ})`);
-  if (CATEGORY_IDS.length && cron.validate(CRAWL_SCHEDULE))
+  if (SEGMENTS.length && cron.validate(CRAWL_SCHEDULE))
     cron.schedule(CRAWL_SCHEDULE, () => doCrawl('cron'), { timezone: TZ });
   if (CRAWL_ON_START) doCrawl('startup');
 });
